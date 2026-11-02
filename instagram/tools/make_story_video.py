@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 FONT_DIR = "/usr/share/fonts/opentype/inter/"
 F_BLACK = FONT_DIR + "InterDisplay-Black.otf"
@@ -131,16 +131,48 @@ def build(src, out, spec):
         vf = f"scale={W}:-2,crop={W}:{H}:0:(ih-{H})*{focus}"
     vf += ",setsar=1,fps=30"
 
+    # desfoque opcional de regiões (telas, documentos, rostos), com borda suave e janela de tempo:
+    #   "blur": [x, y, w, h]  (região única, o clipe inteiro)  ou
+    #   "blur_regions": [{"box": [x, y, w, h], "t": [ini, fim]}, ...]  (coordenadas 1080x1920, segundos da SAÍDA)
+    regions = []
+    if spec.get("blur"):
+        regions.append({"box": spec["blur"], "t": [0, 9999]})
+    regions += spec.get("blur_regions", [])
+    power = int(spec.get("blur_power", 45))
+    feather = int(spec.get("blur_feather", 60))
+
     with tempfile.TemporaryDirectory() as td:
         png = os.path.join(td, "overlay.png")
         overlay_png(spec, png)
+        extra_inputs = []
+        chain = f"[0:v]{vf}"
+        if regions:
+            n = len(regions)
+            chain += f",split={n + 1}[base]" + "".join(f"[r{i}]" for i in range(n)) + ";"
+            cur = "base"
+            for i, reg in enumerate(regions):
+                bx, by, bw, bh = [int(v) for v in reg["box"]]
+                t0, t1 = reg.get("t", [0, 9999])
+                mask = Image.new("L", (W, H), 0)
+                ImageDraw.Draw(mask).rounded_rectangle((bx, by, bx + bw, by + bh), radius=40, fill=255)
+                mask = mask.filter(ImageFilter.GaussianBlur(feather / 2))
+                mpath = os.path.join(td, f"mask{i}.png")
+                mask.save(mpath)
+                extra_inputs += ["-loop", "1", "-framerate", "30", "-t", f"{duration}", "-i", mpath]
+                midx = 2 + i  # índice do input (0 = vídeo, 1 = texto)
+                chain += (f"[r{i}]boxblur={power}:4[bb{i}];[bb{i}][{midx}:v]alphamerge[a{i}];"
+                          f"[{cur}][a{i}]overlay=0:0:enable='between(t,{t0},{t1})'[m{i}];")
+                cur = f"m{i}"
+            chain += f"[{cur}]null[v];"
+        else:
+            chain += "[v];"
         filt = (
-            f"[0:v]{vf}[v];"
+            chain +
             f"[1:v]format=rgba,fade=t=in:st=0:d={fade}:alpha=1[o];"
             f"[v][o]overlay=0:0:format=auto[out]"
         )
         cmd = ["ffmpeg", "-y", "-ss", f"{start}", "-t", f"{duration}", "-i", src,
-               "-loop", "1", "-framerate", "30", "-t", f"{duration}", "-i", png,
+               "-loop", "1", "-framerate", "30", "-t", f"{duration}", "-i", png] + extra_inputs + [
                "-filter_complex", filt, "-map", "[out]"]
         if spec.get("mute"):
             cmd += ["-an"]
